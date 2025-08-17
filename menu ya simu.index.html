@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="sw">
+<head>
+  <meta charset="UTF-8">
+  <title>Kavishe Speed & Location</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0; padding: 0;
+      background: #111;
+      color: #fff;
+    }
+    header {
+      text-align: center;
+      padding: 15px;
+      background: #222;
+      font-size: 22px;
+      font-weight: bold;
+      color: #f33;
+      letter-spacing: 1px;
+    }
+    #map { height: 350px; margin: 10px; border-radius: 10px; }
+    .controls {
+      padding: 10px; background: #222; display: flex; flex-wrap: wrap; gap: 6px;
+      justify-content: center;
+    }
+    input, button {
+      padding: 8px; border-radius: 5px; border: none;
+    }
+    button { background: #f33; color: white; cursor: pointer; }
+    button:hover { opacity: 0.8; }
+
+    pre { background: #000; color: #0f0; padding: 10px; white-space: pre-line; margin: 0; }
+
+    /* Dashboard */
+    .dashboard {
+      margin: 20px auto;
+      width: 300px; height: 300px;
+      border: 10px solid #333;
+      border-radius: 50%;
+      position: relative;
+      background: radial-gradient(circle, #222 60%, #111);
+      color: white;
+    }
+    .needle {
+      width: 4px; height: 120px;
+      background: red;
+      position: absolute;
+      bottom: 50%; left: 50%;
+      transform-origin: bottom center;
+      transform: rotate(-90deg);
+      transition: transform 0.2s ease-out;
+      z-index: 10;
+    }
+    .center-dot {
+      width: 20px; height: 20px;
+      background: #f33;
+      border-radius: 50%;
+      position: absolute;
+      bottom: 50%; left: 50%;
+      transform: translate(-50%, 50%);
+      z-index: 11;
+    }
+    .numbers { position: absolute; width: 100%; height: 100%; top: 0; left: 0; }
+    .numbers span {
+      position: absolute; font-size: 14px; transform: translate(-50%, -50%);
+      color: #fff;
+    }
+    .speed-label {
+      position: absolute; width: 100%; text-align: center;
+      bottom: 30px; font-size: 18px;
+    }
+    .speed-text { font-size: 26px; font-weight: bold; margin-top: 5px; }
+
+    .extra-info { text-align: center; margin: 10px; font-size: 16px; }
+    .odometer {
+      font-size: 18px; margin-top: 10px;
+      color: #0f0; font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <header>Kavishe Speed & Location</header>
+
+  <div class="controls">
+    <input id="originInput" placeholder="Eneo la Sasa (mf. Kiwalaa)"/>
+    <input id="destinationInput" placeholder="Eneo la Kuenda (mf. Kiboriloni)"/>
+    <input id="speedInput" type="number" placeholder="Speed (km/h)" value="60"/>
+    <button onclick="calculateTravel()">Hesabu Safari</button>
+    <button onclick="startGPS()">Anza Kusoma Speed (GPS)</button>
+    <button onclick="resetOdometer()">Reset Odometer</button>
+  </div>
+
+  <!-- Dashboard -->
+  <div class="dashboard">
+    <div id="needle" class="needle"></div>
+    <div class="center-dot"></div>
+    <div class="numbers" id="numbers"></div>
+    <div class="speed-label">
+      Kasi (km/h)
+      <div id="speedValue" class="speed-text">0</div>
+    </div>
+  </div>
+
+  <div class="extra-info">
+    Gear: <span id="gearValue">N</span> |
+    Odometer: <span id="odometerValue">0.00</span> km
+  </div>
+
+  <pre id="resultOutput"></pre>
+  <div id="map"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script>
+    // Anzisha ramani
+    const map = L.map('map').setView([-6.8, 39.28], 12); 
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
+
+    let originMarker, destinationMarker, routeLine;
+    let odometer = 0;
+    let lastPosition = null;
+
+    function clearMap() {
+      if (originMarker) map.removeLayer(originMarker);
+      if (destinationMarker) map.removeLayer(destinationMarker);
+      if (routeLine) map.removeLayer(routeLine);
+    }
+
+    function showError(msg) {
+      document.getElementById('resultOutput').textContent = "Error: " + msg;
+    }
+
+    // Geocoding
+    async function geocode(place) {
+      const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(place)}&countrycodes=tz`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!data.length) throw new Error("Hakuna eneo limepatikana: " + place);
+      return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon), display_name: data[0].display_name };
+    }
+
+    // OSRM
+    async function getRoute(from, to) {
+      const url = `https://router.project-osrm.org/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (!data.routes || !data.routes.length) throw new Error("Hakuna barabara imepatikana.");
+      const r = data.routes[0];
+      return { distance: r.distance, duration: r.duration, geometry: r.geometry };
+    }
+
+    // Chora route
+    function drawRoute(from, to, geometry) {
+      clearMap();
+      originMarker = L.marker([from.lat, from.lon]).addTo(map).bindPopup("Nilipo sasa");
+      destinationMarker = L.marker([to.lat, to.lon]).addTo(map).bindPopup("Ninakoenda");
+      routeLine = L.geoJSON(geometry, {style: {color: 'yellow', weight: 5}}).addTo(map);
+      map.fitBounds(routeLine.getBounds().pad(0.3));
+    }
+
+    // Tengeneza namba kwenye dashboard
+    function createNumbers() {
+      const container = document.getElementById("numbers");
+      const maxSpeed = 180;
+      for (let s = 0; s <= maxSpeed; s += 20) {
+        const span = document.createElement("span");
+        const angle = (s / maxSpeed) * 180 - 90;
+        const rad = angle * Math.PI / 180;
+        const r = 120;
+        const x = 150 + r * Math.cos(rad);
+        const y = 150 + r * Math.sin(rad);
+        span.style.left = x + "px";
+        span.style.top = y + "px";
+        span.textContent = s;
+        container.appendChild(span);
+      }
+    }
+    createNumbers();
+
+    // Update dashboard
+    function updateDashboard(speed) {
+      const needle = document.getElementById("needle");
+      const speedVal = document.getElementById("speedValue");
+      const maxSpeed = 180;
+      const angle = (speed / maxSpeed) * 180 - 90;
+      needle.style.transform = `rotate(${angle}deg)`;
+      speedVal.textContent = Math.round(speed);
+
+      // Gear
+      let gear = "N";
+      if (speed > 0 && speed <= 20) gear = "G1";
+      else if (speed <= 40) gear = "G2";
+      else if (speed <= 60) gear = "G3";
+      else if (speed <= 100) gear = "G4";
+      else if (speed > 100) gear = "G5";
+      document.getElementById("gearValue").textContent = gear;
+    }
+
+    // Reset Odometer
+    function resetOdometer() {
+      odometer = 0;
+      document.getElementById("odometerValue").textContent = odometer.toFixed(2);
+      lastPosition = null;
+    }
+
+    // Start GPS
+    function startGPS() {
+      if (!navigator.geolocation) {
+        showError("Geolocation haipatikani kwenye browser hii.");
+        return;
+      }
+      navigator.geolocation.watchPosition(
+        pos => {
+          const coords = pos.coords;
+          const speed = coords.speed ? coords.speed * 3.6 : 0; // m/s → km/h
+          updateDashboard(speed);
+
+          // Hesabu odometer
+          if (lastPosition) {
+            const R = 6371e3; // m
+            const φ1 = lastPosition.lat * Math.PI/180;
+            const φ2 = coords.latitude * Math.PI/180;
+            const Δφ = (coords.latitude - lastPosition.lat) * Math.PI/180;
+            const Δλ = (coords.longitude - lastPosition.lon) * Math.PI/180;
+            const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                      Math.cos(φ1) * Math.cos(φ2) *
+                      Math.sin(Δλ/2) * Math.sin(Δλ/2);
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+            const d = R * c; // mita
+            odometer += d / 1000; // km
+            document.getElementById("odometerValue").textContent = odometer.toFixed(2);
+          }
+          lastPosition = { lat: coords.latitude, lon: coords.longitude };
+        },
+        err => { showError("GPS Error: " + err.message); },
+        { enableHighAccuracy: true }
+      );
+    }
+
+    // Safari ETA
+    async function calculateTravel() {
+      const originVal = document.getElementById('originInput').value.trim();
+      const destVal = document.getElementById('destinationInput').value.trim();
+      const speedVal = parseFloat(document.getElementById('speedInput').value) || 60;
+      const resultOutput = document.getElementById('resultOutput');
+
+      if (!originVal || !destVal) {
+        showError('Tafadhali jaza Eneo la Sasa na Eneo la Kuenda.');
+        return;
+      }
+
+      try {
+        const from = await geocode(originVal);
+        const to = await geocode(destVal);
+        const route = await getRoute(from, to);
+        const distanceKm = (route.distance / 1000).toFixed(2);
+
+        const hoursMy = distanceKm / speedVal;
+        const totalMinsMy = Math.round(hoursMy * 60);
+        const hMy = Math.floor(totalMinsMy / 60);
+        const mMy = totalMinsMy % 60;
+
+        const minsOsrm = Math.round(route.duration / 60);
+        const hOsrm = Math.floor(minsOsrm / 60);
+        const mOsrm = minsOsrm % 60;
+
+        resultOutput.textContent =
+          `Umbali: ${distanceKm} km\n` +
+          `ETA kwa speed yako (${speedVal} km/h): ${hMy}h ${mMy}m\n` +
+          `ETA ya OSRM: ${hOsrm}h ${mOsrm}m\n\n` +
+          `Kutoka: ${from.display_name}\nKwenda: ${to.display_name}`;
+
+        drawRoute(from, to, route.geometry);
+      } catch (e) {
+        showError(e.message);
+      }
+    }
+  </script>
+</body>
+</html>
